@@ -30,8 +30,33 @@ then detect and install them without requiring manual firmware enrollment.
 ### VMware Infrastructure
 - **ESXi 8.0.2 or later** on all hosts where target VMs are running
   - Earlier ESXi versions will not regenerate NVRAM with 2023 certificates
+  - Check host versions: `Get-VMHost | Select Name, Version` in PowerCLI
 - **vCenter Server** — the script connects via the PowerCLI vCenter API
-- **VMware Tools** installed and running on all target VMs
+
+### VM Hardware Version
+- **Hardware version 13 or later** (introduced in vSphere 6.5) — required for EFI firmware and Secure Boot support
+- **Hardware version 14 or later** — required for vTPM (relevant to the BitLocker safety check)
+- VMs below version 13 will be silently excluded by the EFI/Secure Boot filter and will not appear in the target list
+- Check hardware versions:
+  ```powershell
+  Get-VM | Select Name, HardwareVersion | Sort-Object HardwareVersion
+  ```
+- Upgrade VM hardware version in vSphere Client (VM must be powered off):
+  **Actions → Compatibility → Upgrade VM Compatibility**
+
+### VMware Tools
+- **VMware Tools must be installed, running, and recognized by vCenter** on all target VMs
+  - The script uses `Invoke-VMScript` for all guest operations; vCenter will reject these calls if Tools is not running
+  - Tools version **10.0 or later** recommended — older versions may not support all script execution features
+  - "Open VM Tools" (OVT) is supported on Windows Server 2019 and later as it ships inbox, but the standard VMware Tools package is preferred for full compatibility
+- Check Tools status across all VMs:
+  ```powershell
+  Get-VM | Select Name,
+      @{N="ToolsStatus";  E={$_.Guest.ExtensionData.ToolsStatus}},
+      @{N="ToolsVersion"; E={$_.Guest.ToolsVersion}} |
+      Where-Object { $_.ToolsStatus -ne "toolsOk" }
+  ```
+- VMs reporting `toolsNotInstalled`, `toolsNotRunning`, or `toolsOld` should be remediated before running the script
 
 ### Guest OS
 - **Windows Server 2016, 2019, or 2022**
@@ -182,7 +207,7 @@ so you can feed it back in to run cleanup on exactly the same set of VMs:
 |-----------|------|-------------|
 | `-VMName` | `string[]` | One or more VM display names. Accepts wildcards. |
 | `-VMListCsv` | `string` | Path to a CSV file with a `VMName` column. |
-| `-GuestCredential` | `PSCredential` | Domain admin credential for guest OS access. Required for main mode. |
+| `-GuestCredential` | `PSCredential` | Admin credential for guest OS access. Required for main mode. |
 | `-NoSnapshot` | `switch` | Skip snapshot creation. Cannot be combined with `-RetainSnapshots`. |
 | `-RetainSnapshots` | `switch` | Keep snapshots even on success. Use with `-CleanupSnapshots` later. |
 | `-CleanupSnapshots` | `switch` | Remove all `Pre-SecureBoot-Fix*` snapshots on target VMs. |
@@ -377,6 +402,28 @@ Increase the Tools wait timeout with `-WaitSeconds`:
 .\FixSecureBootBulk.ps1 -VMName "slow-vm" -GuestCredential $cred -WaitSeconds 180
 ```
 
+### VMware Tools not installed or not running
+
+`Invoke-VMScript` will fail immediately if VMware Tools is not installed, not
+running, or in an unmanaged state. Check Tools status on a specific VM:
+
+```powershell
+(Get-VM "vm01").Guest.ExtensionData.ToolsStatus
+# Expected: toolsOk
+# Problem states: toolsNotInstalled, toolsNotRunning, toolsOld
+```
+
+If Tools is installed but not running, start it from an elevated command prompt
+on the guest:
+
+```cmd
+net start "VMware Tools"
+```
+
+If Tools is not installed, deploy it via vSphere Client (**VM → Guest OS →
+Install VMware Tools**) or through your software deployment tooling before
+running the script. After installation a reboot is required.
+
 ### Snapshot creation fails
 
 Check available datastore space. Each snapshot consumes space proportional to the
@@ -385,3 +432,7 @@ amount of disk I/O that occurs while it exists. If space is constrained, use
 array snapshot or backup taken immediately before running the script).
 
 ---
+
+## License
+
+MIT License. See `LICENSE` for details.
