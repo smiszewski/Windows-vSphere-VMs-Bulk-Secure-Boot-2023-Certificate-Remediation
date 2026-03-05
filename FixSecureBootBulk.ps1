@@ -70,6 +70,28 @@
     Does not require -GuestCredential. If no snapshot exists the NVRAM is
     still restored, but VM state (registry changes etc.) will not be reverted.
 
+.PARAMETER PKDerPath
+    Path to WindowsOEMDevicesPK.der downloaded from the Microsoft secureboot_objects
+    GitHub repository. When provided, the script enrolls a valid Platform Key on any
+    VM where the PK is NULL, invalid, or an ESXi-generated placeholder (Valid_Other)
+    after cert remediation. VMs with a proper Microsoft or OEM PK are skipped.
+
+    Download:
+    https://github.com/microsoft/secureboot_objects/blob/main/PreSignedObjects/PK/Certificate/WindowsOEMDevicesPK.der
+
+    Required for step 9 PK remediation. If omitted, invalid/placeholder PKs are
+    reported in the output CSV but not remediated.
+
+    NOTE: Broadcom KB 423919 references PK_SigListContent.bin, which does not exist
+    in the repository. WindowsOEMDevicesPK.der is the correct file. The script
+    converts it to EFI Signature List format internally via Format-SecureBootUEFI.
+
+.PARAMETER KEKDerPath
+    Path to the Microsoft KEK 2K CA 2023 certificate in DER format. Optional — only
+    needed if the KEK 2023 cert is somehow absent after NVRAM regeneration (should
+    not occur on ESXi 8.0.2+). Download:
+    https://github.com/microsoft/secureboot_objects/blob/main/PreSignedObjects/KEK/Certificates/microsoft%20corporation%20kek%202k%20ca%202023.der
+
 .PARAMETER WaitSeconds
     Seconds to wait after issuing a reboot before polling for Tools.
     Default 90. Increase for slower VMs.
@@ -111,9 +133,25 @@
     # Feed a previous run's output CSV back in to clean up NVRAM for that batch
     .\FixSecureBootBulk.ps1 -VMListCsv ".\SecureBoot_Bulk_20260227_124728.csv" -CleanupNvram
 
+    # Full remediation including PK enrollment (recommended — download WindowsOEMDevicesPK.der first)
+    .\FixSecureBootBulk.ps1 -VMListCsv ".atch1.csv" -GuestCredential $cred `
+        -RetainSnapshots -PKDerPath ".\WindowsOEMDevicesPK.der"
+
+    # Full remediation with PK enrollment and BitLocker key backup
+    .\FixSecureBootBulk.ps1 -VMListCsv ".atch1.csv" -GuestCredential $cred `
+        -RetainSnapshots -PKDerPath ".\WindowsOEMDevicesPK.der" `
+        -BitLockerBackupShare "\\fileserver\BitLockerKeys"
+
 .NOTES
     Do not include domain controllers in automated runs — handle DCs manually.
-    VMs with BitLocker active will be skipped automatically.
+    VMs with BitLocker active will be skipped unless -BitLockerBackupShare is
+    provided, in which case recovery keys are backed up to the share and
+    BitLocker is suspended for the duration of the process.
+    PK remediation (-PKDerPath) requires ESXi 8.0+ hosts. VMs with a proper
+    Microsoft or OEM PK (Valid_WindowsOEM / Valid_Microsoft) are skipped for the
+    PK step automatically. ESXi-generated placeholder PKs (Valid_Other) are treated
+    as needing enrollment per Broadcom KB 423919.
+    References: Broadcom KB 423893, KB 423919, Microsoft secureboot_objects GitHub.
     Ensure sufficient datastore space for snapshots before running large batches.
     Requires VMware.PowerCLI module and an active vCenter connection, or
     the script will prompt for vCenter credentials on first run.
@@ -128,6 +166,9 @@ param(
     [switch]$CleanupSnapshots,
     [switch]$CleanupNvram,
     [switch]$Rollback,
+    [string]$BitLockerBackupShare,
+    [string]$PKDerPath,
+    [string]$KEKDerPath,
     [int]$WaitSeconds = 90
 )
 
@@ -143,6 +184,31 @@ $modeSwitches = @($CleanupSnapshots, $CleanupNvram, $Rollback) | Where-Object { 
 if ($modeSwitches.Count -gt 1) {
     Write-Error "-CleanupSnapshots, -CleanupNvram, and -Rollback are mutually exclusive. Specify only one."
     return
+}
+if ($BitLockerBackupShare) {
+    if (-not (Test-Path $BitLockerBackupShare)) {
+        Write-Error "BitLockerBackupShare path not accessible: $BitLockerBackupShare"
+        Write-Error "Ensure the share exists and is writable from this machine."
+        return
+    }
+    Write-Host "BitLocker backup share: $BitLockerBackupShare" -ForegroundColor Yellow
+    Write-Warning "Recovery keys written to this share are sensitive. Ensure access is restricted to authorized administrators."
+    Write-Host ""
+}
+
+if ($PKDerPath -and -not (Test-Path $PKDerPath)) {
+    Write-Error "PKDerPath not found: $PKDerPath"
+    Write-Error "Download WindowsOEMDevicesPK.der from:"
+    Write-Error "  https://github.com/microsoft/secureboot_objects/blob/main/PreSignedObjects/PK/Certificate/WindowsOEMDevicesPK.der"
+    return
+}
+if ($KEKDerPath -and -not (Test-Path $KEKDerPath)) {
+    Write-Error "KEKDerPath not found: $KEKDerPath"
+    return
+}
+if ($PKDerPath) {
+    Write-Host "PK der file : $PKDerPath" -ForegroundColor Cyan
+    if ($KEKDerPath) { Write-Host "KEK der file: $KEKDerPath" -ForegroundColor Cyan }
 }
 
 # =============================================================================
@@ -440,6 +506,53 @@ $bl  = Get-BitLockerVolume | Where-Object { $_.ProtectionStatus -eq "On" }
 } | ConvertTo-Json -Compress
 '@
 
+# Export all BitLocker recovery keys from the guest (returns JSON array)
+$bitLockerExportScript = @'
+$ErrorActionPreference = 'SilentlyContinue'
+$WarningPreference     = 'SilentlyContinue'
+$ProgressPreference    = 'SilentlyContinue'
+$keys = @()
+$volumes = Get-BitLockerVolume
+foreach ($vol in $volumes) {
+    foreach ($protector in $vol.KeyProtector) {
+        if ($protector.KeyProtectorType -eq 'RecoveryPassword') {
+            $keys += [PSCustomObject]@{
+                DriveLetter      = $vol.MountPoint
+                VolumeStatus     = $vol.VolumeStatus.ToString()
+                ProtectionStatus = $vol.ProtectionStatus.ToString()
+                KeyProtectorType = $protector.KeyProtectorType.ToString()
+                KeyID            = $protector.KeyProtectorId
+                RecoveryPassword = $protector.RecoveryPassword
+            }
+        }
+    }
+}
+if ($keys.Count -gt 0) { $keys | ConvertTo-Json -Compress } else { "[]" }
+'@
+
+# Suspend BitLocker on all encrypted volumes.
+# RebootCount 2 covers the power-off/power-on cycle and the post-fix reboot.
+$bitLockerSuspendScript = @'
+$ErrorActionPreference = 'SilentlyContinue'
+$WarningPreference     = 'SilentlyContinue'
+$ProgressPreference    = 'SilentlyContinue'
+$result = @{ Suspended = @(); Failed = @(); Notes = "" }
+$volumes = Get-BitLockerVolume | Where-Object { $_.ProtectionStatus -eq "On" }
+foreach ($vol in $volumes) {
+    try {
+        Suspend-BitLocker -MountPoint $vol.MountPoint -RebootCount 2 -ErrorAction Stop | Out-Null
+        $result["Suspended"] += $vol.MountPoint
+    } catch {
+        $result["Failed"] += $vol.MountPoint
+        $result["Notes"]  += "Failed to suspend $($vol.MountPoint): $($_.Exception.Message) "
+    }
+}
+$result["Notes"] += if ($result["Suspended"].Count -gt 0) {
+    "Suspended on: $($result['Suspended'] -join ', '). Auto-resumes after 2 reboots. "
+} else { "" }
+$result | ConvertTo-Json -Compress
+'@
+
 # Verify 2023 certs present in NVRAM after regeneration
 $certVerifyScript = @'
 try {
@@ -521,6 +634,137 @@ try {
 
 $result | ConvertTo-Json -Compress
 '@
+
+# Check Platform Key validity in guest (used before PK remediation).
+# PK_Status values:
+#   Valid_WindowsOEM — Microsoft WindowsOEMDevicesPK, proper for Windows Update KEK auth
+#   Valid_Microsoft  — Microsoft-signed PK, proper for Windows Update KEK auth
+#   Valid_Other      — ESXi writes placeholder data when regenerating NVRAM on < 9.0 hosts.
+#                      Broadcom KB 423919: "For ESXi versions earlier than 9.0, a valid PK
+#                      is not present." This PK will not authenticate Windows Update KEK
+#                      changes — treat as needing enrollment.
+#   Invalid_NULL     — No PK data at all (original state before NVRAM regeneration)
+$pkCheckScript = @'
+$ErrorActionPreference = 'SilentlyContinue'
+$WarningPreference     = 'SilentlyContinue'
+$blActive = ((Get-BitLockerVolume | Where-Object { $_.ProtectionStatus -eq "On" }).Count -gt 0).ToString()
+$pk = Get-SecureBootUEFI -Name PK
+if ($null -eq $pk -or $null -eq $pk.Bytes -or $pk.Bytes.Length -lt 44) {
+    [PSCustomObject]@{ PK_Status = "Invalid_NULL"; BitLockerActive = $blActive } | ConvertTo-Json -Compress
+} else {
+    $cert = $pk.Bytes[44..($pk.Bytes.Length - 1)]
+    if ($null -eq $cert -or $cert.Length -eq 0) {
+        [PSCustomObject]@{ PK_Status = "Invalid_NULL"; BitLockerActive = $blActive } | ConvertTo-Json -Compress
+    } else {
+        $t = [System.Text.Encoding]::ASCII.GetString($cert)
+        $s = if ($t -match 'Windows OEM Devices') { "Valid_WindowsOEM" }
+             elseif ($t -match 'Microsoft')        { "Valid_Microsoft"  }
+             else                                  { "Valid_Other"      }
+        [PSCustomObject]@{ PK_Status = $s; BitLockerActive = $blActive } | ConvertTo-Json -Compress
+    }
+}
+'@
+
+# Post-enrollment PK verification
+$verifyPKScript = @'
+$ErrorActionPreference = 'SilentlyContinue'
+$WarningPreference     = 'SilentlyContinue'
+$pk = Get-SecureBootUEFI -Name PK
+$pkStatus = "Unknown"
+if ($null -eq $pk -or $null -eq $pk.Bytes -or $pk.Bytes.Length -lt 44) {
+    $pkStatus = "Invalid_NULL"
+} else {
+    $cert = $pk.Bytes[44..($pk.Bytes.Length - 1)]
+    if ($null -eq $cert -or $cert.Length -eq 0) {
+        $pkStatus = "Invalid_NULL"
+    } else {
+        $pkText = [System.Text.Encoding]::ASCII.GetString($cert)
+        if     ($pkText -match 'Windows OEM Devices') { $pkStatus = "Valid_WindowsOEM" }
+        elseif ($pkText -match 'Microsoft')           { $pkStatus = "Valid_Microsoft"  }
+        else                                          { $pkStatus = "Valid_Other"       }
+    }
+}
+[PSCustomObject]@{ PK_Status = $pkStatus } | ConvertTo-Json -Compress
+'@
+
+# Enroll PK (and optionally KEK) while guest is in UEFI SetupMode.
+# Expects DER-encoded certificate files copied to C:\Windows\Temp\.
+# Uses Format-SecureBootUEFI to convert the DER cert to EFI Signature List
+# format, then pipes directly to Set-SecureBootUEFI. This is required because
+# Set-SecureBootUEFI -ContentFilePath expects ESL format, not raw DER.
+# In SetupMode (PK slot empty/placeholder) no signing is needed.
+$enrollPKScript = @'
+$ErrorActionPreference = 'SilentlyContinue'
+$WarningPreference     = 'SilentlyContinue'
+$result = @{ PKEnrolled = $false; KEKUpdated = $false; Notes = "" }
+
+$setupMode = (Get-SecureBootUEFI SetupMode -EA SilentlyContinue).Bytes
+if ($setupMode -and $setupMode[0] -eq 1) {
+    try {
+        $pkFile = "C:\Windows\Temp\WindowsOEMDevicesPK.der"
+        if (Test-Path $pkFile) {
+            # Microsoft SignatureOwner GUID for Windows OEM Devices PK
+            $ownerGuid = "55555555-0000-0000-0000-000000000000"
+            Format-SecureBootUEFI -Name PK `
+                -CertificateFilePath $pkFile `
+                -SignatureOwner $ownerGuid `
+                -FormatWithCert `
+                -Time "2025-10-23T11:00:00Z" `
+                -ErrorAction Stop |
+            Set-SecureBootUEFI -Time "2025-10-23T11:00:00Z" -ErrorAction Stop
+            $result["PKEnrolled"] = $true
+            $result["Notes"] += "PK enrolled successfully (from WindowsOEMDevicesPK.der). "
+        } else {
+            $result["Notes"] += "WindowsOEMDevicesPK.der not found at $pkFile. "
+        }
+    } catch {
+        $result["Notes"] += "PK enrollment failed: $($_.Exception.Message) "
+    }
+
+    $kekFile = "C:\Windows\Temp\kek2023.der"
+    if (Test-Path $kekFile) {
+        try {
+            $ownerGuid = "77fa9abd-0359-4d32-bd60-28f4e78f784b"
+            Format-SecureBootUEFI -Name KEK `
+                -CertificateFilePath $kekFile `
+                -SignatureOwner $ownerGuid `
+                -FormatWithCert `
+                -AppendWrite `
+                -Time "2025-10-23T11:00:00Z" `
+                -ErrorAction Stop |
+            Set-SecureBootUEFI -AppendWrite -Time "2025-10-23T11:00:00Z" -ErrorAction Stop
+            $result["KEKUpdated"] = $true
+            $result["Notes"] += "KEK 2023 updated successfully. "
+        } catch {
+            $result["Notes"] += "KEK update failed: $($_.Exception.Message) "
+        }
+    }
+} else {
+    $result["Notes"] = "VM is NOT in SetupMode. Check uefi.secureBootMode.overrideOnce VMX option."
+}
+
+$result | ConvertTo-Json -Compress
+'@
+
+# =============================================================================
+# VMX OPTION HELPERS (used for UEFI SetupMode PK enrollment)
+# =============================================================================
+function Set-VMXOption {
+    param($VMObj, [string]$Key, [string]$Value)
+    $spec        = New-Object VMware.Vim.VirtualMachineConfigSpec
+    $extra       = New-Object VMware.Vim.OptionValue
+    $extra.Key   = $Key
+    $extra.Value = $Value
+    $spec.ExtraConfig = @($extra)
+    ($VMObj | Get-View).ReconfigVM($spec)
+}
+
+function Get-VMXOption {
+    param($VMObj, [string]$Key)
+    return ($VMObj | Get-View).Config.ExtraConfig |
+        Where-Object { $_.Key -eq $Key } |
+        Select-Object -ExpandProperty Value -First 1
+}
 
 # =============================================================================
 # SNAPSHOT CLEANUP MODE
@@ -884,6 +1128,65 @@ if ($confirm -notmatch '^[Yy]') { Write-Host "Aborted."; return }
 $report = [System.Collections.Generic.List[PSObject]]::new()
 
 # =============================================================================
+# BITLOCKER KEY BACKUP FUNCTION
+# =============================================================================
+function Backup-BitLockerKeys {
+    param($VMObj, [string]$BackupShare, [string]$Timestamp)
+    Write-Host "    Exporting BitLocker recovery keys from guest..." -ForegroundColor Gray
+    try {
+        $exportOut = Invoke-VMScript -VM $VMObj -ScriptText $bitLockerExportScript `
+            -ScriptType Powershell -GuestCredential $GuestCredential -ErrorAction Stop
+        $jsonLine = ($exportOut.ScriptOutput -split "`r?`n" |
+            Where-Object { $_.Trim() -match '^\[' -or $_.Trim() -match '^\{' } |
+            Select-Object -Last 1).Trim()
+        if (-not $jsonLine -or $jsonLine -eq "[]") {
+            Write-Host "    No RecoveryPassword protectors found on this VM." -ForegroundColor Gray
+            return $true
+        }
+        $keyData = $jsonLine | ConvertFrom-Json
+        if (-not $keyData) { return $true }
+        if ($keyData -isnot [System.Array]) { $keyData = @($keyData) }
+        Write-Host "    Found $($keyData.Count) recovery key(s)." -ForegroundColor Yellow
+
+        $lines  = @()
+        $lines += "BitLocker Recovery Key Backup"
+        $lines += "============================="
+        $lines += "VM Name    : $($VMObj.Name)"
+        $lines += "Generated  : $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+        $lines += "Purpose    : Pre-Secure-Boot-fix backup per Broadcom KB 423919"
+        $lines += ""
+        $lines += "SECURITY NOTICE: This file contains sensitive cryptographic recovery"
+        $lines += "material. Store securely and restrict access to authorized personnel."
+        $lines += ""
+        $lines += ("-" * 60)
+        foreach ($key in $keyData) {
+            $lines += ""
+            $lines += "Drive            : $($key.DriveLetter)"
+            $lines += "Volume Status    : $($key.VolumeStatus)"
+            $lines += "Protection Status: $($key.ProtectionStatus)"
+            $lines += "Protector Type   : $($key.KeyProtectorType)"
+            $lines += "Key ID           : $($key.KeyID)"
+            $lines += "Recovery Password: $($key.RecoveryPassword)"
+            $lines += ("-" * 60)
+        }
+
+        $fileName  = "$($VMObj.Name)_BitLockerKeys_${Timestamp}.txt"
+        $sharePath = Join-Path $BackupShare $fileName
+        try {
+            $lines | Out-File -FilePath $sharePath -Encoding UTF8 -ErrorAction Stop
+            Write-Host "    Recovery key(s) written to: $sharePath" -ForegroundColor Green
+            return $true
+        } catch {
+            Write-Warning "    Failed to write backup file to share: $($_.Exception.Message)"
+            return $false
+        }
+    } catch {
+        Write-Warning "    BitLocker key export from guest failed: $($_.Exception.Message)"
+        return $false
+    }
+}
+
+# =============================================================================
 # MAIN PROCESSING LOOP
 # =============================================================================
 foreach ($vm in $vms) {
@@ -895,18 +1198,23 @@ foreach ($vm in $vms) {
     Write-Host "$('='*60)" -ForegroundColor White
 
     $row = [PSCustomObject]@{
-        VMName           = $vmName
-        SnapshotCreated  = $false
-        BitLockerSkipped = $false
-        NVRAMRenamed     = $false
-        KEK_AfterNVRAM   = "Not checked"
-        DB_AfterNVRAM    = "Not checked"
-        UpdateTriggered  = $false
-        KEK_2023         = "Not checked"
-        DB_2023          = "Not checked"
-        FinalStatus      = "Not checked"
-        SnapshotRetained = $false
-        Notes            = ""
+        VMName              = $vmName
+        SnapshotCreated     = $false
+        BitLockerSkipped    = $false
+        BitLockerKeysBacked = $false
+        BitLockerSuspended  = $false
+        NVRAMRenamed        = $false
+        KEK_AfterNVRAM      = "Not checked"
+        DB_AfterNVRAM       = "Not checked"
+        UpdateTriggered     = $false
+        KEK_2023            = "Not checked"
+        DB_2023             = "Not checked"
+        FinalStatus         = "Not checked"
+        PK_Status           = "Not checked"
+        PKEnrolled          = $false
+        PKRemediated        = $false
+        SnapshotRetained    = $false
+        Notes               = ""
     }
 
     try {
@@ -914,7 +1222,7 @@ foreach ($vm in $vms) {
         # Step 0 - BitLocker safety check (only if VM is powered on)
         # ------------------------------------------------------------------
         if ($vm.PowerState -eq "PoweredOn") {
-            Write-Host "  [0/7] Checking BitLocker/TPM..." -ForegroundColor Cyan
+            Write-Host "  [0/9] Checking BitLocker/TPM..." -ForegroundColor Cyan
             try {
                 $tpmOut  = Invoke-VMScript -VM $vm -ScriptText $tpmCheckScript `
                     -ScriptType Powershell -GuestCredential $GuestCredential -EA Stop
@@ -923,15 +1231,49 @@ foreach ($vm in $vms) {
                 $tpmData = $jsonLine | ConvertFrom-Json
 
                 if ($tpmData.BitLockerActive) {
-                    Write-Warning "  BitLocker ACTIVE on $vmName - SKIPPING."
-                    Write-Warning "  Suspend BitLocker first, then re-run against this VM."
-                    $row.BitLockerSkipped = $true
-                    $row.Notes = "SKIPPED - BitLocker active. Suspend BitLocker then re-run."
-                    $report.Add($row)
-                    continue
+                    if (-not $BitLockerBackupShare) {
+                        Write-Warning "  BitLocker ACTIVE on $vmName - SKIPPING."
+                        Write-Warning "  Provide -BitLockerBackupShare to back up keys and proceed automatically."
+                        $row.BitLockerSkipped = $true
+                        $row.Notes = "SKIPPED - BitLocker active. Provide -BitLockerBackupShare to process."
+                        $report.Add($row)
+                        continue
+                    }
+
+                    Write-Host "  BitLocker ACTIVE - backing up keys and suspending before proceeding..." -ForegroundColor Yellow
+
+                    # Back up recovery keys to share - abort if backup fails
+                    $blTimestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+                    $backupOk = Backup-BitLockerKeys -VMObj $vm -BackupShare $BitLockerBackupShare -Timestamp $blTimestamp
+                    $row.BitLockerKeysBacked = $backupOk
+                    if (-not $backupOk) {
+                        Write-Warning "  Recovery key backup failed. Skipping $vmName to avoid lockout."
+                        Write-Warning "  Resolve the share access issue and re-run."
+                        $row.BitLockerSkipped = $true
+                        $row.Notes = "SKIPPED - BitLocker key backup to share failed."
+                        $report.Add($row)
+                        continue
+                    }
+
+                    # Suspend BitLocker (RebootCount 2 covers power-off/on + post-fix reboot)
+                    $suspendOut  = Invoke-VMScript -VM $vm -ScriptText $bitLockerSuspendScript `
+                        -ScriptType Powershell -GuestCredential $GuestCredential -ErrorAction Stop
+                    $suspendJson = ($suspendOut.ScriptOutput -split "`r?`n" |
+                        Where-Object { $_.Trim() -match '^{' } |
+                        Select-Object -Last 1).Trim()
+                    if ($suspendJson) {
+                        $suspendData = $suspendJson | ConvertFrom-Json
+                        $row.BitLockerSuspended = ($suspendData.Suspended.Count -gt 0)
+                        Write-Host "    $($suspendData.Notes)" -ForegroundColor $(if ($row.BitLockerSuspended) {"Green"} else {"Yellow"})
+                        $row.Notes += "BL: $($suspendData.Notes) "
+                        if (-not $row.BitLockerSuspended) {
+                            Write-Warning "  BitLocker suspension failed - proceeding but recovery may trigger on reboot."
+                            Write-Warning "  Recovery key is backed up at: $BitLockerBackupShare"
+                        }
+                    }
                 }
-                if ($tpmData.TPMPresent) {
-                    Write-Host "  vTPM present, BitLocker not active - proceeding with caution." -ForegroundColor Yellow
+                if ($tpmData.TPMPresent -and -not $tpmData.BitLockerActive) {
+                    Write-Host "  vTPM present, BitLocker not active - proceeding." -ForegroundColor Yellow
                     $row.Notes += "vTPM present. "
                 }
             } catch {
@@ -943,10 +1285,10 @@ foreach ($vm in $vms) {
         # Step 1 - Take snapshot (skipped if -NoSnapshot)
         # ------------------------------------------------------------------
         if ($NoSnapshot) {
-            Write-Host "  [1/7] Skipping snapshot (-NoSnapshot specified)." -ForegroundColor Yellow
+            Write-Host "  [1/9] Skipping snapshot (-NoSnapshot specified)." -ForegroundColor Yellow
             $row.Notes += "No snapshot taken (-NoSnapshot). "
         } else {
-            Write-Host "  [1/7] Taking snapshot..." -ForegroundColor Cyan
+            Write-Host "  [1/9] Taking snapshot..." -ForegroundColor Cyan
             $snapResult          = New-VMSnapshotSafe -VMObj $vm -Name $snapshotName `
                 -Description "Pre Secure Boot 2023 cert fix - automated snapshot"
             $row.SnapshotCreated = $snapResult
@@ -960,7 +1302,7 @@ foreach ($vm in $vms) {
         # ------------------------------------------------------------------
         # Step 2 - Power off
         # ------------------------------------------------------------------
-        Write-Host "  [2/7] Powering off..." -ForegroundColor Cyan
+        Write-Host "  [2/9] Powering off..." -ForegroundColor Cyan
         if ($vm.PowerState -eq "PoweredOn") {
             Stop-VM -VM $vm -Confirm:$false -Kill -ErrorAction Stop | Out-Null
             Start-Sleep -Seconds 10
@@ -969,7 +1311,7 @@ foreach ($vm in $vms) {
         # ------------------------------------------------------------------
         # Step 3 - Rename NVRAM (triggers fresh generation with 2023 certs)
         # ------------------------------------------------------------------
-        Write-Host "  [3/7] Renaming NVRAM file on datastore..." -ForegroundColor Cyan
+        Write-Host "  [3/9] Renaming NVRAM file on datastore..." -ForegroundColor Cyan
         $row.NVRAMRenamed = Rename-VMNvram -VMObj $vm
         if (-not $row.NVRAMRenamed) {
             $row.Notes += "NVRAM rename failed - cert update may not succeed. "
@@ -978,7 +1320,7 @@ foreach ($vm in $vms) {
         # ------------------------------------------------------------------
         # Step 4 - Power on (ESXi regenerates NVRAM with 2023 KEK)
         # ------------------------------------------------------------------
-        Write-Host "  [4/7] Powering on (ESXi regenerates NVRAM with 2023 certs)..." -ForegroundColor Cyan
+        Write-Host "  [4/9] Powering on (ESXi regenerates NVRAM with 2023 certs)..." -ForegroundColor Cyan
         Start-VM -VM $vm | Out-Null
         $vm = Get-VM -Name $vmName
         if (-not (Wait-VMTools -VM $vm -TimeoutSeconds 300)) {
@@ -1009,7 +1351,7 @@ foreach ($vm in $vms) {
         # ------------------------------------------------------------------
         # Step 5 - Clear stale registry state, set AvailableUpdates, trigger task
         # ------------------------------------------------------------------
-        Write-Host "  [5/7] Clearing stale state and triggering update..." -ForegroundColor Cyan
+        Write-Host "  [5/9] Clearing stale state and triggering update..." -ForegroundColor Cyan
         $updateOut = Invoke-VMScript -VM $vm -ScriptText $updateScript `
             -ScriptType Powershell -GuestCredential $GuestCredential -EA Stop
         Write-Host $updateOut.ScriptOutput -ForegroundColor Gray
@@ -1018,7 +1360,7 @@ foreach ($vm in $vms) {
         # ------------------------------------------------------------------
         # Step 6 - Reboot, trigger task again
         # ------------------------------------------------------------------
-        Write-Host "  [6/7] Rebooting..." -ForegroundColor Cyan
+        Write-Host "  [6/9] Rebooting..." -ForegroundColor Cyan
         Restart-VMGuest -VM $vm -Confirm:$false | Out-Null
         Start-Sleep -Seconds $WaitSeconds
         $vm = Get-VM -Name $vmName
@@ -1034,9 +1376,9 @@ foreach ($vm in $vms) {
         Write-Host $taskOut.ScriptOutput -ForegroundColor Gray
 
         # ------------------------------------------------------------------
-        # Step 7 - Final verification
+        # Step 7 - Final verification (KEK/DB cert status)
         # ------------------------------------------------------------------
-        Write-Host "  [7/7] Verifying final status..." -ForegroundColor Cyan
+        Write-Host "  [7/9] Verifying final KEK/DB cert status..." -ForegroundColor Cyan
         $verifyOut  = Invoke-VMScript -VM $vm -ScriptText $verifyScript `
             -ScriptType Powershell -GuestCredential $GuestCredential -EA Stop
         $verifyData = $verifyOut.ScriptOutput.Trim() | ConvertFrom-Json
@@ -1045,16 +1387,249 @@ foreach ($vm in $vms) {
         $row.DB_2023     = $verifyData.DB_2023
         $row.FinalStatus = $verifyData.Servicing_Status
 
-        $allGood = ($row.FinalStatus -eq "Updated" -and
-                    $row.KEK_2023   -eq "True"     -and
-                    $row.DB_2023    -eq "True")
+        $certGood = ($row.FinalStatus -eq "Updated" -and
+                     $row.KEK_2023   -eq "True"     -and
+                     $row.DB_2023    -eq "True")
 
-        $color = if ($allGood) { "Green" } else { "Yellow" }
+        $color = if ($certGood) { "Green" } else { "Yellow" }
         Write-Host ("  Status: {0} | KEK 2023: {1} | DB 2023: {2} | AvailableUpdates: {3}" -f
             $row.FinalStatus, $row.KEK_2023, $row.DB_2023,
             $verifyData.AvailableUpdates) -ForegroundColor $color
 
+        # ------------------------------------------------------------------
+        # Step 8 - Platform Key (PK) check
+        # VMs on ESXi < 9.0 have a NULL PK by default. A valid PK is required
+        # for Windows to authenticate future KEK/DB updates. Without it the
+        # same certificate expiry situation will recur. This step always runs;
+        # remediation (step 9) is skipped only when PK is already valid.
+        # ------------------------------------------------------------------
+        Write-Host "  [8/9] Checking Platform Key (PK) validity..." -ForegroundColor Cyan
+        $pkGood = $false
+        $pkBitLockerActive = $false
+        try {
+            $pkOut  = Invoke-VMScript -VM $vm -ScriptText $pkCheckScript `
+                -ScriptType Powershell -GuestCredential $GuestCredential -EA Stop
+            $pkJson = ($pkOut.ScriptOutput -split "`r?`n" |
+                Where-Object { $_.Trim() -match '^\{' } | Select-Object -Last 1).Trim()
+            if ($pkJson) {
+                $pkData = $pkJson | ConvertFrom-Json
+                $row.PK_Status     = $pkData.PK_Status
+                # Only WindowsOEM and Microsoft PKs are trusted by Windows Update
+                # for authenticating future KEK changes. Valid_Other is ESXi's
+                # placeholder — per Broadcom KB 423919 ESXi < 9.0 has no valid PK.
+                $pkGood            = $pkData.PK_Status -in @("Valid_WindowsOEM", "Valid_Microsoft")
+                $pkBitLockerActive = $pkData.BitLockerActive -eq "True"
+                $pkColor = if ($pkGood) { "Green" } elseif ($pkData.PK_Status -eq "Valid_Other") { "Yellow" } else { "Red" }
+                Write-Host ("    PK Status    : {0}" -f $pkData.PK_Status) -ForegroundColor $pkColor
+                if ($pkData.PK_Status -eq "Valid_Other") {
+                    Write-Host "    NOTE: Valid_Other = ESXi placeholder PK (not trusted by Windows Update for KEK auth)." -ForegroundColor Yellow
+                    Write-Host "    Enrollment of proper PK required per Broadcom KB 423919." -ForegroundColor Yellow
+                }
+                Write-Host ("    BitLocker    : {0}" -f $(if ($pkBitLockerActive) {"Active"} else {"Inactive"})) `
+                    -ForegroundColor $(if ($pkBitLockerActive) {"Yellow"} else {"Gray"})
+            }
+        } catch {
+            Write-Warning "    PK check failed: $($_.Exception.Message)"
+            $row.Notes += "PK check failed. "
+        }
+
+        if ($pkGood) {
+            Write-Host ("    PK is valid ({0}) — no remediation needed." -f $row.PK_Status) -ForegroundColor Green
+            $row.PKRemediated = $true
+
+        } elseif (-not $PKDerPath) {
+            Write-Warning "    PK is invalid/NULL/placeholder. Provide -PKDerPath to remediate automatically."
+            Write-Warning "    Download WindowsOEMDevicesPK.der from:"
+            Write-Warning "    https://github.com/microsoft/secureboot_objects/blob/main/PreSignedObjects/PK/Certificate/WindowsOEMDevicesPK.der"
+            $row.Notes += "PK invalid/placeholder - re-run with -PKDerPath to remediate. "
+
+        } else {
+            # ------------------------------------------------------------------
+            # Step 9 - PK remediation (Broadcom KB 423919)
+            #
+            # Two methods exist per KB 423919:
+            #
+            #   ESXi >= 8.0 (SetupMode) — automated below:
+            #     Set uefi.secureBootMode.overrideOnce = SetupMode, boot into
+            #     guest, run Format-SecureBootUEFI | Set-SecureBootUEFI with
+            #     WindowsOEMDevicesPK.der (DER-encoded certificate).
+            #
+            #   ESXi 7.x (disk + allowAuthBypass + UEFI BIOS UI) — cannot be
+            #     automated: requires a FAT32 VMDK containing WindowsOEMDevicesPK.der
+            #     attached to the VM, then manually navigating the UEFI setup UI
+            #     to Secure Boot Configuration → PK Options → Enroll PK.
+            #     This script will detect and report this case but cannot proceed.
+            #
+            # NOTE: BitLocker suspension from step 0 is consumed by the cert
+            # update reboots (steps 2 and 6). If BitLocker has auto-resumed by
+            # the time we get here, it is re-suspended before the SetupMode
+            # reboot to prevent a PCR 7 change from triggering recovery mode.
+            # ------------------------------------------------------------------
+
+            # Check ESXi host version — SetupMode requires ESXi >= 8.0
+            $vmHost    = Get-VMHost -VM $vm -ErrorAction SilentlyContinue
+            $hostVerStr = $vmHost.Version
+            $hostMajor  = [int]($hostVerStr -split '\.')[0]
+
+            if ($hostMajor -lt 8) {
+                Write-Warning "  [9/9] PK remediation skipped — ESXi host is version $hostVerStr (requires 8.0+)."
+                Write-Warning "  The ESXi 7.x method requires a FAT32 VMDK containing WindowsOEMDevicesPK.der,"
+                Write-Warning "  manual UEFI setup UI interaction, and uefi.allowAuthBypass = TRUE."
+                Write-Warning "  See Broadcom KB 423919 for the full manual procedure."
+                $row.Notes += "PK remediation skipped — host ESXi $hostVerStr requires manual disk/BIOS method (KB 423919). "
+            } else {
+
+            Write-Host "  [9/9] Remediating PK via UEFI SetupMode (ESXi $hostVerStr)..." -ForegroundColor Yellow
+
+            # --- BitLocker re-check before SetupMode reboot ---
+            # The step 0 suspension (RebootCount 2) covers the cert-update power
+            # cycle (step 2) and the cert-update reboot (step 6). By the time we
+            # reach here BitLocker may have auto-resumed. Re-suspend if active.
+            $skipPKRemediation = $false
+            if ($pkBitLockerActive) {
+                Write-Host "    BitLocker has auto-resumed — re-suspending before SetupMode reboot..." -ForegroundColor Yellow
+                if (-not $BitLockerBackupShare) {
+                    Write-Warning "    BitLocker is active but no -BitLockerBackupShare was provided."
+                    Write-Warning "    Cannot safely proceed with PK remediation — skipping to avoid lockout."
+                    $row.Notes += "PK remediation skipped — BitLocker active at PK step, no backup share. Re-run with -BitLockerBackupShare to process. "
+                    $skipPKRemediation = $true
+                } else {
+                    # Back up keys again — state may have changed since step 0
+                    $pkTimestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+                    $pkBackupOk  = Backup-BitLockerKeys -VMObj $vm -BackupShare $BitLockerBackupShare -Timestamp "PK_$pkTimestamp"
+                    if (-not $pkBackupOk) {
+                        Write-Warning "    Recovery key backup failed — skipping PK remediation to avoid lockout."
+                        $row.Notes += "PK remediation skipped — BitLocker re-backup failed at PK step. "
+                        $skipPKRemediation = $true
+                    } else {
+                        $suspendOut2  = Invoke-VMScript -VM $vm -ScriptText $bitLockerSuspendScript `
+                            -ScriptType Powershell -GuestCredential $GuestCredential -ErrorAction Stop
+                        $suspendJson2 = ($suspendOut2.ScriptOutput -split "`r?`n" |
+                            Where-Object { $_.Trim() -match '^\{' } | Select-Object -Last 1).Trim()
+                        if ($suspendJson2) {
+                            $suspendData2 = $suspendJson2 | ConvertFrom-Json
+                            Write-Host ("    $($suspendData2.Notes)") -ForegroundColor $(if ($suspendData2.Suspended.Count -gt 0) {"Green"} else {"Yellow"})
+                            $row.Notes += "BL re-suspend at PK step: $($suspendData2.Notes) "
+                        }
+                    }
+                }
+            }
+
+            if (-not $skipPKRemediation) {
+
+            # [1/5] Set SetupMode VMX option
+            Write-Host "  [PK 1/5] Setting UEFI SetupMode VMX option..." -ForegroundColor Cyan
+            Set-VMXOption -VMObj $vm -Key "uefi.secureBootMode.overrideOnce" -Value "SetupMode"
+            $optVal = Get-VMXOption -VMObj (Get-VM -Name $vmName) -Key "uefi.secureBootMode.overrideOnce"
+            if ($optVal -ne "SetupMode") {
+                throw "Failed to set uefi.secureBootMode.overrideOnce — check vCenter permissions."
+            }
+            Write-Host "    SetupMode VMX option confirmed." -ForegroundColor Green
+
+            # [2/5] Power off and on — SetupMode takes effect on next boot
+            Write-Host "  [PK 2/5] Rebooting into SetupMode..." -ForegroundColor Cyan
+            Stop-VM -VM $vm -Confirm:$false -Kill -ErrorAction Stop | Out-Null
+            Start-Sleep -Seconds 5
+            Start-VM -VM $vm | Out-Null
+            $vm = Get-VM -Name $vmName
+            if (-not (Wait-VMTools -VM $vm -TimeoutSeconds 300)) {
+                throw "Tools timeout after SetupMode reboot."
+            }
+            Write-Host "    VM is back online." -ForegroundColor Green
+
+            # [3/5] Copy .der certificate file(s) to guest temp
+            Write-Host "  [PK 3/5] Copying .der certificate file(s) to guest..." -ForegroundColor Cyan
+            try {
+                Copy-VMGuestFile -Source $PKDerPath `
+                    -Destination "C:\Windows\Temp\WindowsOEMDevicesPK.der" `
+                    -VM $vm -LocalToGuest -GuestCredential $GuestCredential -ErrorAction Stop
+                Write-Host "    WindowsOEMDevicesPK.der copied." -ForegroundColor Green
+            } catch {
+                throw "Failed to copy PK der file to guest: $($_.Exception.Message)"
+            }
+            if ($KEKDerPath) {
+                try {
+                    Copy-VMGuestFile -Source $KEKDerPath `
+                        -Destination "C:\Windows\Temp\kek2023.der" `
+                        -VM $vm -LocalToGuest -GuestCredential $GuestCredential -ErrorAction Stop
+                    Write-Host "    kek2023.der copied." -ForegroundColor Green
+                } catch {
+                    Write-Warning "    Failed to copy KEK der — KEK update will be skipped: $($_.Exception.Message)"
+                }
+            }
+
+            # [4/5] Enroll PK via Set-SecureBootUEFI
+            Write-Host "  [PK 4/5] Enrolling PK via Set-SecureBootUEFI..." -ForegroundColor Cyan
+            Write-Host "    NOTE: If this fails due to UAC, run Set-SecureBootUEFI directly" -ForegroundColor Yellow
+            Write-Host "    on the VM console in an elevated PowerShell session." -ForegroundColor Yellow
+
+            $enrollOut  = Invoke-VMScript -VM $vm -ScriptText $enrollPKScript `
+                -ScriptType Powershell -GuestCredential $GuestCredential -ErrorAction Stop
+            $enrollJson = ($enrollOut.ScriptOutput -split "`r?`n" |
+                Where-Object { $_.Trim() -match '^\{' } | Select-Object -Last 1).Trim()
+            if ($enrollJson) {
+                $enrollData = $enrollJson | ConvertFrom-Json
+                Write-Host ("    PKEnrolled : {0}" -f $enrollData.PKEnrolled) -ForegroundColor $(if ($enrollData.PKEnrolled) {"Green"} else {"Red"    })
+                Write-Host ("    KEKUpdated : {0}" -f $enrollData.KEKUpdated) -ForegroundColor $(if ($enrollData.KEKUpdated) {"Green"} else {"Yellow" })
+                Write-Host ("    Notes      : {0}" -f $enrollData.Notes)      -ForegroundColor Gray
+                $row.Notes += "PK enroll: $($enrollData.Notes) "
+                if (-not $enrollData.PKEnrolled) {
+                    Write-Warning "    PK enrollment did not succeed via Invoke-VMScript (may be a UAC elevation issue)."
+                    Write-Warning "    Run the following directly on the VM in an elevated PowerShell session:"
+                    Write-Host   '    Format-SecureBootUEFI -Name PK -CertificateFilePath "C:\Windows\Temp\WindowsOEMDevicesPK.der" -SignatureOwner "55555555-0000-0000-0000-000000000000" -FormatWithCert -Time "2025-10-23T11:00:00Z" | Set-SecureBootUEFI -Time "2025-10-23T11:00:00Z"' -ForegroundColor White
+                }
+            } else {
+                Write-Warning "    No JSON output from enrollment script."
+                $row.Notes += "Enrollment script returned no parseable output. "
+            }
+
+            # [5/5] Clear SetupMode VMX option, reboot, verify
+            Write-Host "  [PK 5/5] Clearing SetupMode, rebooting, and verifying PK..." -ForegroundColor Cyan
+            # Clear explicitly — if enrollment failed the option must be cleared
+            # before retry to avoid persisting SetupMode unexpectedly
+            Set-VMXOption -VMObj (Get-VM -Name $vmName) -Key "uefi.secureBootMode.overrideOnce" -Value ""
+            Write-Host "    SetupMode VMX option cleared." -ForegroundColor Gray
+
+            Restart-VMGuest -VM $vm -Confirm:$false | Out-Null
+            Start-Sleep -Seconds $WaitSeconds
+            $vm = Get-VM -Name $vmName
+            if (-not (Wait-VMTools -VM $vm -TimeoutSeconds 300)) {
+                throw "Tools timeout after post-enrollment reboot."
+            }
+
+            $pkVerifyOut  = Invoke-VMScript -VM $vm -ScriptText $verifyPKScript `
+                -ScriptType Powershell -GuestCredential $GuestCredential -EA Stop
+            $pkVerifyJson = ($pkVerifyOut.ScriptOutput -split "`r?`n" |
+                Where-Object { $_.Trim() -match '^\{' } | Select-Object -Last 1).Trim()
+            if ($pkVerifyJson) {
+                $pkVerifyData  = $pkVerifyJson | ConvertFrom-Json
+                $row.PK_Status    = $pkVerifyData.PK_Status
+                $row.PKEnrolled   = $true   # enrollment was attempted this run
+                $row.PKRemediated = ($pkVerifyData.PK_Status -like "Valid*")
+                $pkColor = if ($row.PKRemediated) { "Green" } else { "Red" }
+                Write-Host ("  PK Status after remediation: {0}" -f $pkVerifyData.PK_Status) -ForegroundColor $pkColor
+                if (-not $row.PKRemediated) {
+                    $row.Notes += "PK still invalid after enrollment — manual intervention required. "
+                }
+            }
+
+            if ($row.BitLockerKeysBacked) {
+                Write-Host "  BitLocker recovery keys retained at: $BitLockerBackupShare" -ForegroundColor Yellow
+                Write-Host "  BitLocker auto-resumes after 2 reboots. Verify protection status after this maintenance window." -ForegroundColor Yellow
+            }
+
+            } # end if (-not $skipPKRemediation)
+            } # end if ($hostMajor -ge 8)
+        }
+
+        # ------------------------------------------------------------------
         # Snapshot disposition
+        # allGood requires: cert update complete AND (PK valid OR remediated
+        # OR no PKDerPath provided — in which case PK is flagged for follow-up
+        # but cert update is complete, which is the minimum for allGood)
+        # ------------------------------------------------------------------
+        $allGood = $certGood -and ($pkGood -or $row.PKRemediated -or (-not $PKDerPath))
+
         if ($NoSnapshot) {
             $row.SnapshotRetained = $false
         } elseif ($allGood -and $snapCreated -and -not $RetainSnapshots) {
@@ -1065,9 +1640,11 @@ foreach ($vm in $vms) {
             $row.SnapshotRetained = $true
             if ($RetainSnapshots -and $allGood) {
                 Write-Host "  Snapshot retained (-RetainSnapshots). Run -CleanupSnapshots when ready." -ForegroundColor Yellow
+            } elseif (-not $certGood) {
+                Write-Host "  Snapshot retained (cert update incomplete — may need second reboot cycle)." -ForegroundColor Yellow
+                $row.Notes += "Cert update incomplete — may need manual second reboot cycle. "
             } elseif (-not $allGood) {
-                Write-Host "  Snapshot retained (not fully updated - may need second reboot cycle)." -ForegroundColor Yellow
-                $row.Notes += "Not fully updated - may need manual second reboot cycle. "
+                Write-Host "  Snapshot retained (PK remediation incomplete)." -ForegroundColor Yellow
             }
         }
 
@@ -1090,23 +1667,59 @@ foreach ($vm in $vms) {
 Write-Host "`n$('='*60)" -ForegroundColor White
 Write-Host "SUMMARY" -ForegroundColor White
 Write-Host "$('='*60)" -ForegroundColor White
-$report | Format-Table VMName, SnapshotCreated, NVRAMRenamed, KEK_AfterNVRAM,
-    UpdateTriggered, KEK_2023, DB_2023, FinalStatus, SnapshotRetained, Notes -AutoSize
+$report | Format-Table VMName, SnapshotCreated, BitLockerKeysBacked, BitLockerSuspended,
+    NVRAMRenamed, KEK_AfterNVRAM, UpdateTriggered, KEK_2023, DB_2023,
+    FinalStatus, PK_Status, PKEnrolled, PKRemediated, SnapshotRetained, Notes -AutoSize
 
 $csvPath = ".\SecureBoot_Bulk_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
 $report | Export-Csv -Path $csvPath -NoTypeInformation
 Write-Host "Exported to: $csvPath" -ForegroundColor Green
 
-$total    = $report.Count
-$complete = ($report | Where-Object { $_.FinalStatus -eq "Updated" }).Count
-$skipped  = ($report | Where-Object { $_.BitLockerSkipped }).Count
-$failed   = ($report | Where-Object { $_.FinalStatus -eq "ERROR" }).Count
-$pending  = $total - $complete - $skipped - $failed
-$retained = ($report | Where-Object { $_.SnapshotRetained }).Count
+$total      = $report.Count
+$complete   = ($report | Where-Object { $_.FinalStatus -eq "Updated" }).Count
+$skipped    = ($report | Where-Object { $_.BitLockerSkipped }).Count
+$failed     = ($report | Where-Object { $_.FinalStatus -eq "ERROR" }).Count
+$pending    = $total - $complete - $skipped - $failed
+$retained   = ($report | Where-Object { $_.SnapshotRetained }).Count
+$blBacked   = ($report | Where-Object { $_.BitLockerKeysBacked -eq $true }).Count
+# PK counters — distinguish already-valid from newly enrolled
+# Valid_Other is expected on ESXi-regenerated NVRAM (VMware's own PK).
+# Valid_WindowsOEM / Valid_Microsoft indicate a vendor/MS-signed PK.
+# All three are treated as valid by the script.
+# Valid_Other = ESXi placeholder; only WindowsOEM/Microsoft count as already-good
+$pkAlreadyValid = ($report | Where-Object { $_.PK_Status -in @("Valid_WindowsOEM","Valid_Microsoft") -and -not $_.PKEnrolled }).Count
+$pkPlaceholder  = ($report | Where-Object { $_.PK_Status -eq "Valid_Other" -and -not $_.PKEnrolled }).Count
+$pkEnrolledOk   = ($report | Where-Object { $_.PKEnrolled -and $_.PKRemediated }).Count
+$pkEnrolledFail = ($report | Where-Object { $_.PKEnrolled -and -not $_.PKRemediated }).Count
+$pkNeeds        = ($report | Where-Object { $_.PK_Status -notlike "Valid*" -and $_.PK_Status -ne "Not checked" }).Count
 
 Write-Host ""
 Write-Host "Completed          : $complete / $total" -ForegroundColor Green
-if ($skipped  -gt 0) { Write-Host "Skipped (BitLocker): $skipped"                                      -ForegroundColor Yellow }
-if ($pending  -gt 0) { Write-Host "Pending            : $pending (may need second reboot cycle)"        -ForegroundColor Yellow }
-if ($failed   -gt 0) { Write-Host "Errors             : $failed"                                        -ForegroundColor Red    }
-if ($retained -gt 0) { Write-Host "Snapshots retained : $retained - run -CleanupSnapshots when ready."  -ForegroundColor Yellow }
+if ($pkAlreadyValid -gt 0) { Write-Host "PK already valid   : $pkAlreadyValid  (WindowsOEM/Microsoft — no enrollment needed)"  -ForegroundColor Green  }
+if ($pkPlaceholder  -gt 0) { Write-Host "PK placeholder     : $pkPlaceholder  (ESXi-generated — enrolled this run)"              -ForegroundColor Green  }
+if ($pkEnrolledOk   -gt 0) { Write-Host "PK enrolled        : $pkEnrolledOk  (newly enrolled this run)"                        -ForegroundColor Green  }
+if ($pkEnrolledFail -gt 0) { Write-Host "PK enroll failed   : $pkEnrolledFail  (manual intervention required — see Notes)"     -ForegroundColor Red    }
+if ($pkNeeds        -gt 0) { Write-Host "PK still invalid   : $pkNeeds  (provide -PKDerPath and re-run)"                       -ForegroundColor Yellow }
+if ($blBacked       -gt 0) { Write-Host "BL keys backed up  : $blBacked  (files at: $BitLockerBackupShare)"                    -ForegroundColor Yellow }
+if ($skipped        -gt 0) { Write-Host "Skipped (BitLocker): $skipped  (provide -BitLockerBackupShare to process)"            -ForegroundColor Yellow }
+if ($pending        -gt 0) { Write-Host "Pending            : $pending (may need second reboot cycle)"                         -ForegroundColor Yellow }
+if ($failed         -gt 0) { Write-Host "Errors             : $failed"                                                         -ForegroundColor Red    }
+if ($retained       -gt 0) { Write-Host "Snapshots retained : $retained — run -CleanupSnapshots when ready."                   -ForegroundColor Yellow }
+
+if ($pkNeeds -gt 0 -and -not $PKDerPath) {
+    Write-Host ""
+    Write-Host "To remediate the NULL/placeholder PK on affected VMs, download WindowsOEMDevicesPK.der from:" -ForegroundColor Cyan
+    Write-Host "  https://github.com/microsoft/secureboot_objects/blob/main/PreSignedObjects/PK/Certificate/WindowsOEMDevicesPK.der" -ForegroundColor Cyan
+    Write-Host "Then re-run with: -PKDerPath '.\WindowsOEMDevicesPK.der'" -ForegroundColor Cyan
+}
+
+# Notes block — shown separately so nothing is truncated by Format-Table
+$noteVMs = $report | Where-Object { $_.Notes -ne "" }
+if ($noteVMs) {
+    Write-Host "`nNOTES" -ForegroundColor White
+    Write-Host "$('='*60)" -ForegroundColor White
+    foreach ($n in $noteVMs) {
+        Write-Host "  $($n.VMName):" -ForegroundColor Cyan
+        Write-Host "    $($n.Notes)"
+    }
+}
